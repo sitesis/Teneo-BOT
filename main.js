@@ -3,6 +3,7 @@ const fs = require("fs");
 const logger = require("./config/logger");
 const colors = require("./config/colors");
 const displayBanner = require("./config/banner");
+const { spawn } = require("child_process");
 
 const CONFIG = {
   WS: {
@@ -20,9 +21,10 @@ const CONFIG = {
     },
   },
   RECONNECT: {
-    MAX_ATTEMPTS: 5,
-    BASE_DELAY: 1000,
-    MAX_DELAY: 30000,
+    ATTEMPTS_BEFORE_RESTART: 20,
+    BASE_DELAY: 30000,
+    MAX_DELAY: 120000,
+    JITTER: 5000,
   },
   FILES: {
     TOKEN_FILE: "data.txt",
@@ -53,6 +55,19 @@ const formatMessage = (prefix, message) => {
   return `${paddedPrefix} > ${message}`;
 };
 
+function restartProgram() {
+  const script = process.argv[1];
+  const args = process.argv.slice(2);
+
+  const child = spawn(process.execPath, [script, ...args], {
+    stdio: "inherit",
+    detached: true,
+  });
+
+  child.unref();
+  process.exit();
+}
+
 class WebSocketClient {
   constructor(token, accountIndex) {
     this.ws = null;
@@ -60,6 +75,7 @@ class WebSocketClient {
     this.reconnectAttempts = 0;
     this.token = token;
     this.accountIndex = accountIndex;
+    this.isRestarting = false;
   }
 
   async connect() {
@@ -192,27 +208,54 @@ class WebSocketClient {
   }
 
   handleReconnect() {
-    if (this.reconnectAttempts < CONFIG.RECONNECT.MAX_ATTEMPTS) {
-      this.reconnectAttempts++;
-      const delay = Math.min(
-        CONFIG.RECONNECT.BASE_DELAY * Math.pow(2, this.reconnectAttempts),
-        CONFIG.RECONNECT.MAX_DELAY
-      );
-      logger.warn(
-        formatMessage(
-          formatAccountPrefix(this.accountIndex),
-          `Reconnecting in ${delay / 1000} seconds...`
-        )
-      );
-      setTimeout(() => this.connect(), delay);
-    } else {
-      logger.error(
-        formatMessage(
-          formatAccountPrefix(this.accountIndex),
-          `Max reconnection attempts reached. Check connection.`
-        )
-      );
+    if (this.isRestarting) return;
+
+    this.reconnectAttempts++;
+
+    if (this.reconnectAttempts >= CONFIG.RECONNECT.ATTEMPTS_BEFORE_RESTART) {
+      this.initiateAutoRestart();
+      return;
     }
+
+    const baseDelay = Math.min(
+      CONFIG.RECONNECT.BASE_DELAY,
+      CONFIG.RECONNECT.MAX_DELAY
+    );
+    const jitter = Math.floor(Math.random() * CONFIG.RECONNECT.JITTER);
+    const delay = baseDelay + jitter;
+
+    logger.warn(
+      formatMessage(
+        formatAccountPrefix(this.accountIndex),
+        `Server unavailable. Attempt ${this.reconnectAttempts}/${
+          CONFIG.RECONNECT.ATTEMPTS_BEFORE_RESTART
+        }. Reconnecting in ${Math.floor(delay / 1000)} seconds...`
+      )
+    );
+
+    setTimeout(() => this.connect(), delay);
+  }
+
+  initiateAutoRestart() {
+    if (this.isRestarting) return;
+    this.isRestarting = true;
+
+    logger.warn(
+      formatMessage(
+        formatAccountPrefix(this.accountIndex),
+        `Maximum reconnection attempts reached. Initiating auto-restart in 10 seconds...`
+      )
+    );
+
+    this.cleanup();
+    if (this.ws) {
+      this.ws.close();
+    }
+
+    setTimeout(() => {
+      logger.info("Restarting program...");
+      restartProgram();
+    }, 10000);
   }
 }
 
